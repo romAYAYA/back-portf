@@ -6,6 +6,7 @@ import { InjectRedis } from '@nestjs-modules/ioredis'
 import { Repository } from 'typeorm'
 import Redis from 'ioredis'
 import { AuthUser } from './entities/auth-user.entity'
+import { Role } from './entities/role.entity'
 import { LoginDto } from './dto/login.dto'
 import { RegisterDto } from './dto/register.dto'
 import { JwtPayload } from './interfaces/jwt-payload.interface'
@@ -18,6 +19,8 @@ export class AuthService {
   constructor(
     @InjectRepository(AuthUser)
     private authUserRepository: Repository<AuthUser>,
+    @InjectRepository(Role)
+    private roleRepository: Repository<Role>,
     @InjectRedis()
     private readonly redis: Redis,
     private jwtService: JwtService,
@@ -28,6 +31,12 @@ export class AuthService {
     const emailExists = await this.authUserRepository.findOne({ where: { email: registerDto.email } })
     if (emailExists) {
       throw new ConflictException('Email already exists')
+    }
+
+    let defaultRole = await this.roleRepository.findOne({ where: { name: 'user' } })
+    if (!defaultRole) {
+      defaultRole = this.roleRepository.create({ name: 'user' })
+      await this.roleRepository.save(defaultRole)
     }
 
     const usernameExists = await this.authUserRepository.findOne({ where: { username: registerDto.username } })
@@ -41,11 +50,19 @@ export class AuthService {
       email: registerDto.email,
       username: registerDto.username,
       password: hashedPassword,
+      roles: [defaultRole],
     })
 
     const savedUser = await this.authUserRepository.save(user)
 
-    const tokens = await this.generateTokens(savedUser.id, savedUser.email, savedUser.username, userAgent, ipAddress)
+    const tokens = await this.generateTokens(
+      savedUser.id,
+      savedUser.email,
+      savedUser.username,
+      [defaultRole.name],
+      userAgent,
+      ipAddress,
+    )
 
     return {
       user: { id: savedUser.id, email: savedUser.email, username: savedUser.username },
@@ -56,17 +73,19 @@ export class AuthService {
   public async login(loginDto: LoginDto, userAgent: string, ipAddress: string) {
     const user = await this.authUserRepository.findOne({
       where: [{ email: loginDto.email }, { username: loginDto.username }],
+      relations: ['roles'],
     })
     if (!user) {
       throw new UnauthorizedException('Invalid credentials')
     }
+    const roles = user.roles.map((role) => role.name)
 
     const isPasswordValid = await bcrypt.compare(loginDto.password, user.password)
     if (!isPasswordValid) {
       throw new UnauthorizedException('Invalid credentials')
     }
 
-    const tokens = await this.generateTokens(user.id, user.email, user.username, userAgent, ipAddress)
+    const tokens = await this.generateTokens(user.id, user.email, user.username, roles, userAgent, ipAddress)
 
     return {
       user: { id: user.id, email: user.email, username: user.username },
@@ -88,15 +107,17 @@ export class AuthService {
 
     const user = await this.authUserRepository.findOne({
       where: { id: tokenData.userId, isActive: true },
+      relations: ['roles'],
     })
     if (!user) {
       throw new UnauthorizedException('User not found')
     }
+    const roles = user.roles.map((role) => role.name)
 
     await this.redis.del(redisKey)
     await this.removeFromUserSessions(tokenData.userId, tokenHash)
 
-    return this.generateTokens(tokenData.userId, tokenData.email, tokenData.username, userAgent, ipAddress)
+    return this.generateTokens(tokenData.userId, tokenData.email, tokenData.username, roles, userAgent, ipAddress)
   }
 
   public async logout(refreshToken: string) {
@@ -121,22 +142,32 @@ export class AuthService {
 
       const user = await this.authUserRepository.findOne({
         where: { id: payload.sub, isActive: true },
+        relations: ['roles'],
       })
       if (!user) {
         throw new UnauthorizedException('User not found')
       }
+      const roles = user.roles.map((role) => role.name)
 
       return {
         sub: payload.sub,
         email: payload.email,
+        roles,
       }
     } catch (error) {
       throw new UnauthorizedException('Invalid token')
     }
   }
 
-  private async generateTokens(userId: string, email: string, username: string, userAgent: string, ipAddress: string) {
-    const payload: JwtPayload = { email, sub: userId }
+  private async generateTokens(
+    userId: string,
+    email: string,
+    username: string,
+    roles: string[],
+    userAgent: string,
+    ipAddress: string,
+  ) {
+    const payload: JwtPayload = { email, sub: userId, roles }
 
     const accessToken = await this.jwtService.signAsync(payload, {
       secret: this.configService.get('JWT_SECRET'),
@@ -152,6 +183,7 @@ export class AuthService {
       userId,
       email,
       username,
+      roles,
       userAgent,
       ipAddress,
       createdAt: Date.now(),
@@ -159,7 +191,6 @@ export class AuthService {
 
     const redisKey = `refresh:${tokenHash}`
     const ttl = 7 * 24 * 60 * 60
-    await this.redis.set(redisKey, JSON.stringify(tokenData), 'EX', ttl)
 
     await this.redis.setex(redisKey, ttl, JSON.stringify(tokenData))
     await this.addToUserSessions(userId, tokenHash, ttl)
