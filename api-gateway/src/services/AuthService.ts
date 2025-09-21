@@ -1,1 +1,5 @@
-class AuthService {}
+class AuthService {
+  test() {
+    console.log('test')
+  }
+}
